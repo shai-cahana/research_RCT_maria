@@ -1,0 +1,13 @@
+# Ignore everything
+*
+
+# But keep this .gitignore file
+!.gitignore
+
+# Allow the first_paper folder
+!first_paper/
+!first_paper/**
+
+# Ignore Excel files anywhere, including inside first_paper
+*.xlsx
+*.xls
