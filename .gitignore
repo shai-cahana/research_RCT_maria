@@ -1,13 +1,18 @@
 # Ignore everything
 *
 
+# But keep directories searchable
+!*/
+
 # But keep this .gitignore file
 !.gitignore
 
-# Allow the first_paper folder
-!first_paper/
-!first_paper/**
+# Keep Python files
+!*.py
 
-# Ignore Excel files anywhere, including inside first_paper
+# Keep Jupyter notebooks
+!*.ipynb
+
+# Ignore Excel files anywhere
 *.xlsx
 *.xls
