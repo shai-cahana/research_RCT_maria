@@ -1556,17 +1556,30 @@ def fit_cox(
     if X is None or X.empty:
         return None, None, "Empty design matrix."
 
+    # lifelines can fail on pandas extension/object dtypes (e.g., nullable Int64).
+    # Normalize to plain numeric dtypes before fitting.
+    X_fit = X.copy()
+    X_fit[time_col] = pd.to_numeric(X_fit[time_col], errors="coerce")
+    X_fit[event_col] = pd.to_numeric(X_fit[event_col], errors="coerce").fillna(0).astype(int)
+    covariate_cols = [c for c in X_fit.columns if c not in [time_col, event_col]]
+    for c in covariate_cols:
+        X_fit[c] = pd.to_numeric(X_fit[c], errors="coerce")
+
+    X_fit = X_fit.dropna(subset=[time_col, event_col] + covariate_cols)
+    if X_fit.empty:
+        return None, None, "No complete rows remain after Cox dtype sanitization."
+
     cph = CoxPHFitter(penalizer=penalizer)
 
     fit_kwargs = dict(duration_col=time_col, event_col=event_col)
     if cluster_col in df.columns:
         # Align cluster series to X.index (X derived from df with drops)
-        cluster_series = df.loc[X.index, cluster_col]
-        X_fit = X.copy()
+        cluster_series = df.loc[X_fit.index, cluster_col]
+        cluster_series = cluster_series.astype("string").fillna("<missing>").astype(str)
         X_fit[cluster_col] = cluster_series.values
         cph.fit(X_fit, **fit_kwargs, robust=robust, cluster_col=cluster_col)
     else:
-        cph.fit(X, **fit_kwargs)
+        cph.fit(X_fit, **fit_kwargs)
 
     tbl = _cox_hr_table(cph)
 
@@ -1574,7 +1587,13 @@ def fit_cox(
     if check_ph:
         try:
             print("PH assumption check (lifelines):")
-            cph.check_assumptions(X, p_value_threshold=0.05, show_plots=False)
+            ph_cols = [c for c in X.columns if c != cluster_col]
+            cph.check_assumptions(
+                X_fit if cluster_col in df.columns else X,
+                p_value_threshold=0.05,
+                show_plots=False,
+                columns=ph_cols,
+            )
         except Exception as e:  # pragma: no cover
             print("PH check failed (non-fatal):", e)
 
