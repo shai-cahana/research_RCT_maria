@@ -2513,3 +2513,734 @@ def compute_probe_tables(
         "results_missing_text": results_missing_text,
         "excel_output_path": excel_output_path,
     }
+
+
+# =============================================================================
+# Cohort-description tables (Table 1 + Unified Screening Table)
+# Mirrors the layout of analysis_utils.py from the implants research,
+# adapted to the RCT episode dataset.
+#
+# Public API:
+#   display_baseline_characteristics_table(rct, ...)
+#   display_unified_screening_table(rct, ...)
+#
+# All math/statistics are local and self-contained; no notebook globals used.
+# =============================================================================
+
+import html as _html
+
+
+# ---------------------------------------------------------------------------
+# HTML rendering helpers (ported from analysis_utils.py, adapted column names)
+# ---------------------------------------------------------------------------
+def _display_html(html_text: str) -> None:
+    """Render HTML in a Jupyter notebook; fall back to printing if IPython is absent."""
+    try:
+        import importlib
+        html_cls = getattr(importlib.import_module("IPython.display"), "HTML")
+        display_fn = getattr(importlib.import_module("IPython.display"), "display")
+    except ImportError:
+        print(html_text)
+        return
+    display_fn(html_cls(html_text))
+
+
+def _render_table_html(
+    dataframe: pd.DataFrame,
+    title: Optional[str] = None,
+    footnote: Optional[str] = None,
+    section_rows: Optional[Iterable[int]] = None,
+    detail_rows: Optional[Iterable[int]] = None,
+    value_align: str = "right",
+) -> str:
+    """Two-column copyable table with optional section headers and indented details."""
+    section_rows = set(section_rows or [])
+    detail_rows = set(detail_rows or [])
+    columns = list(dataframe.columns)
+
+    wrapper_style = "max-width: 980px; margin: 0;"
+    title_style = (
+        "font-family: Calibri, Arial, sans-serif; font-size: 16px; font-weight: 700; "
+        "margin: 0 0 10px 0; color: #111827;"
+    )
+    table_style = (
+        "border-collapse: collapse; width: 100%; font-family: Calibri, Arial, sans-serif; "
+        "font-size: 11pt; table-layout: fixed;"
+    )
+    header_cell_style = (
+        "border-top: 1.5pt solid #374151; border-bottom: 1.5pt solid #374151; "
+        "padding: 8px 10px; text-align: left; font-weight: 700; background-color: #ffffff; "
+        "white-space: normal; word-break: break-word; overflow-wrap: anywhere;"
+    )
+    char_cell_style = (
+        "padding: 7px 10px; border-bottom: 1px solid #d1d5db; vertical-align: top; "
+        "text-align: left; white-space: normal; word-break: break-word; overflow-wrap: anywhere;"
+    )
+    value_cell_style = (
+        "padding: 7px 10px; border-bottom: 1px solid #d1d5db; vertical-align: top; "
+        f"text-align: {value_align}; white-space: normal; word-break: break-word; overflow-wrap: anywhere;"
+    )
+    section_char_style = (
+        "padding: 8px 10px; border-top: 1.5pt solid #94a3b8; border-bottom: 1px solid #cbd5e1; "
+        "background-color: #eef2f7; font-weight: 700; text-align: left; "
+        "white-space: normal; word-break: break-word; overflow-wrap: anywhere;"
+    )
+    section_value_style = (
+        "padding: 8px 10px; border-top: 1.5pt solid #94a3b8; border-bottom: 1px solid #cbd5e1; "
+        "background-color: #eef2f7;"
+    )
+    footnote_style = (
+        "font-family: Calibri, Arial, sans-serif; font-size: 10pt; margin-top: 8px; color: #374151;"
+    )
+
+    parts = [f'<div style="{wrapper_style}">']
+    if title:
+        parts.append(f'<div style="{title_style}">{_html.escape(title)}</div>')
+
+    parts.append(f'<table style="{table_style}">')
+    if len(columns) == 2:
+        parts.append('<colgroup><col style="width: 62%;"><col style="width: 38%;"></colgroup>')
+    parts.append("<thead><tr>")
+    for col in columns:
+        parts.append(f'<th style="{header_cell_style}">{_html.escape(str(col))}</th>')
+    parts.append("</tr></thead><tbody>")
+
+    for idx, row in dataframe.iterrows():
+        parts.append("<tr>")
+        is_section = idx in section_rows
+        is_detail = idx in detail_rows
+
+        for col_idx, col in enumerate(columns):
+            cell_text = "" if pd.isna(row[col]) else str(row[col])
+            if is_section:
+                cell_style = section_char_style if col_idx == 0 else section_value_style
+            else:
+                cell_style = char_cell_style if col_idx == 0 else value_cell_style
+                if col_idx == 0 and is_detail:
+                    cell_style += " padding-left: 28px;"
+            parts.append(f'<td style="{cell_style}">{_html.escape(cell_text)}</td>')
+        parts.append("</tr>")
+
+    parts.append("</tbody></table>")
+    if footnote:
+        parts.append(f'<div style="{footnote_style}">{_html.escape(footnote)}</div>')
+    parts.append("</div>")
+    return "".join(parts)
+
+
+def _render_wide_table_html(
+    dataframe: pd.DataFrame,
+    title: Optional[str] = None,
+    footnote: Optional[str] = None,
+    numeric_columns: Optional[Iterable[str]] = None,
+) -> str:
+    """Wide multi-column copyable table (used for the unified screening table)."""
+    columns = list(dataframe.columns)
+    numeric_columns = set(numeric_columns or [])
+
+    wrapper_style = "max-width: 100%; margin: 0; overflow-x: auto;"
+    title_style = (
+        "font-family: Calibri, Arial, sans-serif; font-size: 16px; font-weight: 700; "
+        "margin: 0 0 10px 0; color: #111827;"
+    )
+    table_style = (
+        "border-collapse: collapse; width: 100%; min-width: 1380px; "
+        "font-family: Calibri, Arial, sans-serif; font-size: 10.5pt; table-layout: auto;"
+    )
+    header_cell_style = (
+        "border-top: 1.5pt solid #374151; border-bottom: 1.5pt solid #374151; "
+        "padding: 8px 10px; text-align: left; font-weight: 700; background-color: #ffffff; "
+        "white-space: normal; word-break: break-word; overflow-wrap: anywhere;"
+    )
+    text_cell_style = (
+        "padding: 7px 10px; border-bottom: 1px solid #d1d5db; vertical-align: top; "
+        "text-align: left; white-space: normal; word-break: break-word; overflow-wrap: anywhere;"
+    )
+    numeric_cell_style = (
+        "padding: 7px 10px; border-bottom: 1px solid #d1d5db; vertical-align: top; "
+        "text-align: right; white-space: normal; word-break: break-word; overflow-wrap: anywhere;"
+    )
+    footnote_style = (
+        "font-family: Calibri, Arial, sans-serif; font-size: 10pt; margin-top: 8px; color: #374151;"
+    )
+
+    parts = [f'<div style="{wrapper_style}">']
+    if title:
+        parts.append(f'<div style="{title_style}">{_html.escape(title)}</div>')
+
+    parts.append(f'<table style="{table_style}">')
+    parts.append("<thead><tr>")
+    for col in columns:
+        parts.append(f'<th style="{header_cell_style}">{_html.escape(str(col))}</th>')
+    parts.append("</tr></thead><tbody>")
+
+    for _, row in dataframe.iterrows():
+        parts.append("<tr>")
+        for col in columns:
+            cell_text = "" if pd.isna(row[col]) else str(row[col])
+            cell_style = numeric_cell_style if col in numeric_columns else text_cell_style
+            parts.append(f'<td style="{cell_style}">{_html.escape(cell_text)}</td>')
+        parts.append("</tr>")
+
+    parts.append("</tbody></table>")
+    if footnote:
+        parts.append(f'<div style="{footnote_style}">{_html.escape(footnote)}</div>')
+    parts.append("</div>")
+    return "".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Formatting primitives
+# ---------------------------------------------------------------------------
+def _fmt_pct(value: float, decimals: int = 1, strip_trailing_zero: bool = False) -> str:
+    formatted = f"{value:.{decimals}f}"
+    if strip_trailing_zero and "." in formatted:
+        formatted = formatted.rstrip("0").rstrip(".")
+    return formatted
+
+
+def _fmt_count_pct(count: int, denominator: int, strip_trailing_zero: bool = False) -> str:
+    pct = (count / denominator * 100) if denominator else 0.0
+    return f"{count:,} ({_fmt_pct(pct, 1, strip_trailing_zero)}%)"
+
+
+def _fmt_mean_sd_range(series: pd.Series, value_decimals: int = 1, range_decimals: int = 0) -> str:
+    clean = pd.to_numeric(series, errors="coerce").dropna()
+    if clean.empty:
+        return "—"
+    vfmt = f"{{:.{value_decimals}f}}"
+    rfmt = f"{{:.{range_decimals}f}}"
+    return (
+        f"{vfmt.format(clean.mean())} ± {vfmt.format(clean.std())} "
+        f"({rfmt.format(clean.min())}-{rfmt.format(clean.max())})"
+    )
+
+
+def _fmt_screening_pct(value: float) -> str:
+    if pd.isna(value):
+        return "—"
+    return f"{float(value):.1f}"
+
+
+def _fmt_screening_p(value: float) -> str:
+    if pd.isna(value):
+        return "—"
+    if value < 0.001:
+        return "<0.001"
+    return f"{value:.3f}"
+
+
+def _fmt_screening_hr(summary_row: Optional[pd.Series]) -> str:
+    if summary_row is None:
+        return "—"
+    hr = summary_row.get("HR")
+    hr_lo = summary_row.get("HR_lo")
+    hr_hi = summary_row.get("HR_hi")
+    if pd.isna(hr) or pd.isna(hr_lo) or pd.isna(hr_hi):
+        return "—"
+    return f"{hr:.2f} ({hr_lo:.2f}-{hr_hi:.2f})"
+
+
+def _fmt_screening_num(value: float, decimals: int = 1) -> str:
+    if pd.isna(value):
+        return "—"
+    return f"{float(value):,.{decimals}f}"
+
+
+# ---------------------------------------------------------------------------
+# Follow-up summary on RCT episodes
+# ---------------------------------------------------------------------------
+def _rct_followup_summary(duration_days: pd.Series, event: pd.Series) -> Dict[str, float]:
+    """Mean/SD/median in years, total tooth-years, incidence per 100 TY."""
+    t = pd.to_numeric(pd.Series(duration_days), errors="coerce") / 365.25
+    e = pd.to_numeric(pd.Series(event), errors="coerce").fillna(0).astype(int)
+    mask = t.notna()
+    t = t.loc[mask]
+    e = e.loc[mask]
+    n = int(len(t))
+    if n == 0:
+        return {
+            "n": 0, "events": 0, "mean": np.nan, "std": np.nan, "median": np.nan,
+            "tooth_years": np.nan, "incidence_per_100_ty": np.nan,
+        }
+    tooth_years = float(t.sum())
+    n_events = int(e.sum())
+    incidence = (n_events / tooth_years * 100) if tooth_years > 0 else np.nan
+    return {
+        "n": n,
+        "events": n_events,
+        "mean": float(t.mean()),
+        "std": float(t.std(ddof=1)) if n > 1 else 0.0,
+        "median": float(t.median()),
+        "tooth_years": tooth_years,
+        "incidence_per_100_ty": incidence,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Configuration: variables shown in Table 1 (patient-level) and the screening table
+# Reference categories follow the manuscript Methods (paragraph 43).
+# ---------------------------------------------------------------------------
+RCT_PATIENT_FLAG_LABELS: Dict[str, str] = {
+    "Smoking": "Smoking",
+    "Diabetes": "Diabetes mellitus",
+    "Hypertension": "Hypertension",
+    "Biphos_use": "Bisphosphonate use",
+    "Cancer": "Malignancy",
+}
+
+
+def _series_sex(data: pd.DataFrame) -> pd.Series:
+    """Derive Sex (Female/Male) from the binary Male flag."""
+    return pd.Series(
+        np.where(pd.to_numeric(data["Male"], errors="coerce").fillna(0) > 0, "Male", "Female"),
+        index=data.index,
+        dtype="object",
+    )
+
+
+def _series_arch(data: pd.DataFrame) -> pd.Series:
+    """Derive Arch (Upper/Lower) from Tooth_Num via classify_tooth."""
+    arch = data["Tooth_Num"].apply(lambda v: classify_tooth(v)[0])
+    arch = arch.where(arch.isin(["Upper", "Lower"]), other=np.nan)
+    return pd.Series(arch, index=data.index, dtype="object")
+
+
+def _series_position(data: pd.DataFrame) -> pd.Series:
+    """Derive Position (Anterior/Posterior) from Tooth_Num via classify_tooth."""
+    pos = data["Tooth_Num"].apply(lambda v: classify_tooth(v)[1])
+    pos = pos.where(pos.isin(["Anterior", "Posterior"]), other=np.nan)
+    return pd.Series(pos, index=data.index, dtype="object")
+
+
+RCT_SCREENING_VARIABLE_SPECS: List[Dict[str, Any]] = [
+    {
+        "label": "Age group",
+        "column": "AgeGroup",
+        "levels": ["<40", "40\u201360", "\u226560"],   # "<40", "40–60", "≥60"
+        "reference": "40\u201360",
+        "kind": "categorical",
+    },
+    {
+        "label": "Sex",
+        "kind": "derived",
+        "levels": ["Female", "Male"],
+        "reference": "Female",
+        "series_fn": _series_sex,
+    },
+    {
+        "label": "Smoking",
+        "column": "Smoking",
+        "levels": ["No", "Yes"],
+        "reference": "No",
+        "kind": "binary",
+    },
+    {
+        "label": "Diabetes mellitus",
+        "column": "Diabetes",
+        "levels": ["No", "Yes"],
+        "reference": "No",
+        "kind": "binary",
+    },
+    {
+        "label": "Hypertension",
+        "column": "Hypertension",
+        "levels": ["No", "Yes"],
+        "reference": "No",
+        "kind": "binary",
+    },
+    {
+        "label": "Bisphosphonate use",
+        "column": "Biphos_use",
+        "levels": ["No", "Yes"],
+        "reference": "No",
+        "kind": "binary",
+    },
+    {
+        "label": "Malignancy",
+        "column": "Cancer",
+        "levels": ["No", "Yes"],
+        "reference": "No",
+        "kind": "binary",
+    },
+    {
+        "label": "Coronal restoration group",
+        "column": "Coronal_Restoration_Group",
+        "levels": ["Neither", "Sealing only", "Sealing + Crown"],
+        "reference": "Neither",
+        "kind": "categorical",
+    },
+    {
+        "label": "Arch",
+        "kind": "derived",
+        "levels": ["Upper", "Lower"],
+        "reference": "Upper",
+        "series_fn": _series_arch,
+    },
+    {
+        "label": "Tooth position",
+        "kind": "derived",
+        "levels": ["Anterior", "Posterior"],
+        "reference": "Posterior",
+        "series_fn": _series_position,
+    },
+]
+
+
+# ---------------------------------------------------------------------------
+# Per-variable screening: levels, log-rank, and Cox HR (cluster-robust)
+# ---------------------------------------------------------------------------
+def _prepare_screening_levels(df: pd.DataFrame, spec: Dict[str, Any]) -> pd.DataFrame:
+    if spec["kind"] == "derived":
+        series = spec["series_fn"](df)
+    else:
+        series = df[spec["column"]]
+
+    if spec["kind"] == "binary":
+        series = pd.Series(
+            np.where(pd.to_numeric(series, errors="coerce").fillna(0) > 0, "Yes", "No"),
+            index=df.index,
+            dtype="object",
+        )
+    else:
+        series = pd.Series(series, index=df.index, dtype="object")
+
+    out = df.copy()
+    out["_screening_level"] = pd.Categorical(series, categories=spec["levels"], ordered=True)
+    out["_time_years"] = pd.to_numeric(out["duration_days"], errors="coerce") / 365.25
+    out = out[
+        out["_screening_level"].notna()
+        & out["_time_years"].notna()
+        & out["event"].notna()
+        & out["Patient_ID"].notna()
+    ].copy()
+    return out
+
+
+def _summarize_screening_levels(data: pd.DataFrame) -> List[Dict[str, Any]]:
+    rows = []
+    for level in data["_screening_level"].cat.categories:
+        sub = data[data["_screening_level"] == level]
+        n_total = int(len(sub))
+        n_events = int(sub["event"].sum()) if n_total else 0
+        ty = float(pd.to_numeric(sub["_time_years"], errors="coerce").sum()) if n_total else np.nan
+        survival_pct = (1 - n_events / n_total) * 100 if n_total else np.nan
+        incidence = (n_events / ty * 100) if ty and ty > 0 else np.nan
+        rows.append({
+            "level": str(level),
+            "n": n_total,
+            "events": n_events,
+            "survival_pct": survival_pct,
+            "tooth_years": ty,
+            "incidence": incidence,
+        })
+    return rows
+
+
+def _compute_screening_log_rank_p(data: pd.DataFrame) -> float:
+    levels_obs = data["_screening_level"].dropna().astype(str)
+    if levels_obs.nunique() < 2 or int(data["event"].sum()) == 0:
+        return np.nan
+    try:
+        result = multivariate_logrank_test(
+            data["_time_years"].values,
+            levels_obs.values,
+            data["event"].astype(int).values,
+        )
+        return float(result.p_value)
+    except Exception:
+        return np.nan
+
+
+def _fit_screening_cox(data: pd.DataFrame, spec: Dict[str, Any]) -> Dict[str, pd.Series]:
+    """Per-variable Cox model with cluster-robust SE on Patient_ID. Returns
+    a {level_label -> Series(HR, HR_lo, HR_hi, p)} mapping for non-reference levels."""
+    categories = list(data["_screening_level"].cat.categories)
+    reference = spec["reference"]
+    design = pd.DataFrame(index=data.index)
+    col_to_level: Dict[str, str] = {}
+
+    for idx, level in enumerate(categories):
+        if level == reference:
+            continue
+        cname = f"x_{idx}"
+        design[cname] = (data["_screening_level"] == level).astype(float)
+        col_to_level[cname] = level
+
+    if design.empty:
+        return {}
+
+    # Drop constant or unstable columns (no variation, or all events / no events)
+    stable = []
+    for c in design.columns:
+        exposed = design[c] == 1
+        ref_mask = design[c] == 0
+        if exposed.sum() == 0 or ref_mask.sum() == 0:
+            continue
+        ev_exposed = int(data.loc[exposed, "event"].sum())
+        ev_ref = int(data.loc[ref_mask, "event"].sum())
+        if ev_exposed in (0, int(exposed.sum())):
+            continue
+        if ev_ref in (0, int(ref_mask.sum())):
+            continue
+        stable.append(c)
+    if not stable:
+        return {}
+    design = design[stable]
+
+    fit_df = design.copy()
+    fit_df["_time_years"] = data["_time_years"].values
+    fit_df["event"] = data["event"].astype(int).values
+    fit_df["Patient_ID"] = data["Patient_ID"].values
+
+    try:
+        model = CoxPHFitter()
+        model.fit(
+            fit_df,
+            duration_col="_time_years",
+            event_col="event",
+            cluster_col="Patient_ID",
+            robust=True,
+        )
+        summary = model.summary
+    except Exception:
+        return {}
+
+    out: Dict[str, pd.Series] = {}
+    for cname, level in col_to_level.items():
+        if cname in summary.index:
+            r = summary.loc[cname]
+            out[level] = pd.Series({
+                "HR": r.get("exp(coef)", np.nan),
+                "HR_lo": r.get("exp(coef) lower 95%", np.nan),
+                "HR_hi": r.get("exp(coef) upper 95%", np.nan),
+                "p": r.get("p", np.nan),
+            })
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Table 1 — Baseline characteristics
+# ---------------------------------------------------------------------------
+def make_baseline_characteristics_table(rct: pd.DataFrame) -> pd.DataFrame:
+    """Table 1 for the primary RCT cohort. Layout mirrors the implants paper:
+    cohort summary → patient-level → tooth-level → restoration-related."""
+    value_col = "Value, n (%) unless otherwise specified"
+
+    # Patient-level aggregation (one row per patient)
+    patient_cols = ["Patient_ID", "Age", "Male"]
+    for col in RCT_PATIENT_FLAG_LABELS:
+        if col in rct.columns:
+            patient_cols.append(col)
+    keep = [c for c in patient_cols if c in rct.columns]
+    pat_agg = {"Age": "first", "Male": "first"}
+    for col in RCT_PATIENT_FLAG_LABELS:
+        if col in rct.columns:
+            pat_agg[col] = "max"
+    pat_summary = rct[keep].groupby("Patient_ID", as_index=False).agg(pat_agg)
+
+    n_patients = int(pat_summary.shape[0])
+    n_episodes = int(len(rct))
+    failures = int(pd.to_numeric(rct["event"], errors="coerce").fillna(0).sum())
+    fu = _rct_followup_summary(rct["duration_days"], rct["event"])
+    eps_per_pat = rct.groupby("Patient_ID").size()
+
+    rows: List[Dict[str, Any]] = []
+
+    # Cohort summary
+    rows.append({"Characteristic": "Cohort summary", value_col: ""})
+    rows.append({"Characteristic": "Patients, n", value_col: f"{n_patients:,}"})
+    rows.append({"Characteristic": "Episodes analyzed, n", value_col: f"{n_episodes:,}"})
+    rows.append({
+        "Characteristic": "Episodes per patient (mean±SD, range)",
+        value_col: _fmt_mean_sd_range(eps_per_pat, value_decimals=1, range_decimals=0),
+    })
+    rows.append({
+        "Characteristic": "Overall tooth survival, %",
+        value_col: _fmt_pct((1 - failures / n_episodes) * 100, 1) if n_episodes else "—",
+    })
+    rows.append({
+        "Characteristic": "Tooth extractions, n (%)",
+        value_col: _fmt_count_pct(failures, n_episodes),
+    })
+    rows.append({
+        "Characteristic": "Follow-up time, years (mean±SD; median [IQR])",
+        value_col: (
+            f"{fu['mean']:.2f} ± {fu['std']:.2f}; "
+            f"median {fu['median']:.2f} "
+            f"[{pd.Series(rct['duration_days'].astype(float)/365.25).quantile(0.25):.2f}"
+            f"\u2013"
+            f"{pd.Series(rct['duration_days'].astype(float)/365.25).quantile(0.75):.2f}]"
+        ),
+    })
+    rows.append({
+        "Characteristic": "Total tooth-years of follow-up",
+        value_col: f"{fu['tooth_years']:,.1f}",
+    })
+    rows.append({
+        "Characteristic": "Failure incidence rate, per 100 tooth-years",
+        value_col: f"{fu['incidence_per_100_ty']:.2f}",
+    })
+
+    # Patient-level characteristics
+    rows.append({"Characteristic": "Patient-level characteristics", value_col: ""})
+    rows.append({
+        "Characteristic": "Age, years (mean±SD, range)",
+        value_col: _fmt_mean_sd_range(pat_summary["Age"], value_decimals=1, range_decimals=0),
+    })
+    female = int((pd.to_numeric(pat_summary["Male"], errors="coerce").fillna(0) == 0).sum())
+    male = int((pd.to_numeric(pat_summary["Male"], errors="coerce").fillna(0) == 1).sum())
+    rows.append({"Characteristic": "Female", value_col: _fmt_count_pct(female, n_patients)})
+    rows.append({"Characteristic": "Male", value_col: _fmt_count_pct(male, n_patients)})
+
+    for col, label in RCT_PATIENT_FLAG_LABELS.items():
+        if col in pat_summary.columns:
+            count = int((pd.to_numeric(pat_summary[col], errors="coerce").fillna(0) > 0).sum())
+            rows.append({"Characteristic": label, value_col: _fmt_count_pct(count, n_patients)})
+
+    # Tooth-level characteristics
+    arch = rct["Tooth_Num"].apply(lambda v: classify_tooth(v)[0])
+    pos = rct["Tooth_Num"].apply(lambda v: classify_tooth(v)[1])
+
+    rows.append({"Characteristic": "Tooth-level characteristics", value_col: ""})
+    rows.append({"Characteristic": "Arch", value_col: ""})
+    for label_in, label_out in [("Upper", "Upper jaw (maxilla)"), ("Lower", "Lower jaw (mandible)")]:
+        c = int((arch == label_in).sum())
+        rows.append({"Characteristic": label_out, value_col: _fmt_count_pct(c, n_episodes)})
+
+    rows.append({"Characteristic": "Tooth position", value_col: ""})
+    for label_in in ["Anterior", "Posterior"]:
+        c = int((pos == label_in).sum())
+        rows.append({"Characteristic": label_in, value_col: _fmt_count_pct(c, n_episodes)})
+
+    # Restoration-related characteristics (coronal restoration group within window)
+    rows.append({"Characteristic": "Restoration-related characteristics", value_col: ""})
+    rows.append({"Characteristic": "Coronal restoration group", value_col: ""})
+    if "Coronal_Restoration_Group" in rct.columns:
+        for grp in ["Neither", "Sealing only", "Sealing + Crown"]:
+            c = int((rct["Coronal_Restoration_Group"] == grp).sum())
+            rows.append({"Characteristic": grp, value_col: _fmt_count_pct(c, n_episodes)})
+
+    return pd.DataFrame(rows)
+
+
+def display_baseline_characteristics_table(rct: pd.DataFrame) -> pd.DataFrame:
+    """Render Table 1 (baseline characteristics) and return the underlying DataFrame."""
+    table = make_baseline_characteristics_table(rct)
+    value_col = [c for c in table.columns if c != "Characteristic"][0]
+
+    # Section rows are blank-value rows; their following non-blank rows are details.
+    section_mask = table[value_col].eq("")
+    detail_mask: List[bool] = []
+    in_section = False
+    for is_section in section_mask.tolist():
+        if is_section:
+            in_section = True
+            detail_mask.append(False)
+        else:
+            detail_mask.append(in_section)
+
+    html_text = _render_table_html(
+        table,
+        title=(
+            "Table 1. Baseline patient, tooth, and restoration characteristics "
+            "of the primary nonsurgical RCT cohort"
+        ),
+        footnote=(
+            "Values are presented as n (%) unless otherwise stated. Patient-level variables are "
+            "reported per patient; tooth-level and restoration-related variables are reported per "
+            "episode (one episode = one primary RCT on a given tooth). Follow-up is summarized in "
+            "years as mean ± SD and median [IQR]. Incidence rate is reported per 100 tooth-years. "
+            "Coronal restoration group reflects recorded sealing/crown procedures within the post-RCT "
+            "window. SD, standard deviation; IQR, interquartile range."
+        ),
+        section_rows=table.index[section_mask].tolist(),
+        detail_rows=table.index[[bool(v) for v in detail_mask]].tolist(),
+        value_align="right",
+    )
+    _display_html(html_text)
+    return table
+
+
+# ---------------------------------------------------------------------------
+# Unified Screening Table — per-variable N / events / survival / log-rank / Cox HR
+# ---------------------------------------------------------------------------
+_SCREENING_COLUMNS = [
+    "Variable",
+    "Level",
+    "N",
+    "Events",
+    "Survival rate (%)",
+    "Log-rank p-value",
+    "Cox HR (95% CI)",
+    "Cox p-value",
+    "Tooth-years (TY)",
+    "Failure incidence rate (per 100 TY)",
+]
+_SCREENING_NUMERIC = {
+    "N", "Events", "Survival rate (%)",
+    "Tooth-years (TY)", "Failure incidence rate (per 100 TY)",
+}
+
+
+def make_unified_screening_table(
+    rct: pd.DataFrame,
+    variable_specs: Optional[Sequence[Dict[str, Any]]] = None,
+) -> pd.DataFrame:
+    """Build the per-variable screening table for the primary RCT cohort."""
+    specs = variable_specs or RCT_SCREENING_VARIABLE_SPECS
+    rows = []
+
+    for spec in specs:
+        analysis_df = _prepare_screening_levels(rct, spec)
+        level_rows = _summarize_screening_levels(analysis_df)
+        log_rank_p = _compute_screening_log_rank_p(analysis_df)
+        cox_rows = _fit_screening_cox(analysis_df, spec)
+
+        for idx, level_row in enumerate(level_rows):
+            level = level_row["level"]
+            cox_row = cox_rows.get(level)
+            is_ref = level == spec["reference"]
+            rows.append({
+                "Variable": spec["label"] if idx == 0 else "",
+                "Level": level,
+                "N": f"{level_row['n']:,}",
+                "Events": f"{level_row['events']:,}",
+                "Survival rate (%)": _fmt_screening_pct(level_row["survival_pct"]),
+                "Log-rank p-value": _fmt_screening_p(log_rank_p) if idx == 0 else "",
+                "Cox HR (95% CI)": "Reference" if is_ref else _fmt_screening_hr(cox_row),
+                "Cox p-value": "" if is_ref else (
+                    _fmt_screening_p(cox_row["p"]) if cox_row is not None else "—"
+                ),
+                "Tooth-years (TY)": _fmt_screening_num(level_row["tooth_years"], decimals=1),
+                "Failure incidence rate (per 100 TY)": _fmt_screening_num(
+                    level_row["incidence"], decimals=2
+                ),
+            })
+
+    return pd.DataFrame(rows, columns=_SCREENING_COLUMNS)
+
+
+def display_unified_screening_table(
+    rct: pd.DataFrame,
+    variable_specs: Optional[Sequence[Dict[str, Any]]] = None,
+) -> pd.DataFrame:
+    """Render the unified screening table and return the underlying DataFrame."""
+    table = make_unified_screening_table(rct, variable_specs=variable_specs)
+    html_text = _render_wide_table_html(
+        table,
+        title=(
+            "Table 2. Unadjusted and per-variable adjusted survival outcomes "
+            "(primary nonsurgical RCT cohort)"
+        ),
+        footnote=(
+            "Tooth-years are calculated from each episode's follow-up duration "
+            "(duration_days / 365.25) within the primary RCT cohort. Failure incidence rate is "
+            "computed as Events / Tooth-years × 100. Log-rank p-values are descriptive and "
+            "unadjusted. Cox hazard ratios are estimated per variable with cluster-robust standard "
+            "errors on Patient_ID."
+        ),
+        numeric_columns=_SCREENING_NUMERIC,
+    )
+    _display_html(html_text)
+    return table
