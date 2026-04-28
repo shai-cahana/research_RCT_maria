@@ -2692,7 +2692,7 @@ def _render_wide_table_html(
 # ---------------------------------------------------------------------------
 # Formatting primitives
 # ---------------------------------------------------------------------------
-def _fmt_pct(value: float, decimals: int = 1, strip_trailing_zero: bool = False) -> str:
+def _fmt_pct_str(value: float, decimals: int = 1, strip_trailing_zero: bool = False) -> str:
     formatted = f"{value:.{decimals}f}"
     if strip_trailing_zero and "." in formatted:
         formatted = formatted.rstrip("0").rstrip(".")
@@ -2701,7 +2701,7 @@ def _fmt_pct(value: float, decimals: int = 1, strip_trailing_zero: bool = False)
 
 def _fmt_count_pct(count: int, denominator: int, strip_trailing_zero: bool = False) -> str:
     pct = (count / denominator * 100) if denominator else 0.0
-    return f"{count:,} ({_fmt_pct(pct, 1, strip_trailing_zero)}%)"
+    return f"{count:,} ({_fmt_pct_str(pct, 1, strip_trailing_zero)}%)"
 
 
 def _fmt_mean_sd_range(series: pd.Series, value_decimals: int = 1, range_decimals: int = 0) -> str:
@@ -3057,7 +3057,7 @@ def make_baseline_characteristics_table(rct: pd.DataFrame) -> pd.DataFrame:
     })
     rows.append({
         "Characteristic": "Overall tooth survival, %",
-        value_col: _fmt_pct((1 - failures / n_episodes) * 100, 1) if n_episodes else "—",
+        value_col: _fmt_pct_str((1 - failures / n_episodes) * 100, 1) if n_episodes else "—",
     })
     rows.append({
         "Characteristic": "Tooth extractions, n (%)",
