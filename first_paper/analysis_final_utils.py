@@ -33,6 +33,9 @@ from __future__ import annotations
 # Imports
 # =============================================================================
 import os
+import shutil
+import subprocess
+import tempfile
 from itertools import combinations
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -600,14 +603,481 @@ def first_episode_per_patient(
 def landmark_dataset(
     episodes: pd.DataFrame,
     landmark_days: int,
+    cohort_value: Optional[str] = None,
+    cohort_col: str = COHORT_COL,
+    start_col: str = "start_date",
+    stop_col: str = "stop_date",
+    failure_col: str = "failure_date",
+    event_col: str = EVENT_COL,
     time_col: str = TIME_COL,
-) -> pd.DataFrame:
-    """Sensitivity dataset: drop failures before ``landmark_days`` and
-    reset the time origin (subtract ``landmark_days``)."""
+    return_qa: bool = False,
+) -> Any:
+    """Build a strict landmark dataset and optionally return QA tables.
+
+    Landmark rules:
+      * Restrict to ``cohort_value`` if provided.
+      * Define ``landmark_date = start_date + landmark_days``.
+      * Keep only episodes at risk at landmark (``stop_date > landmark_date``).
+      * Create post-landmark outcomes:
+          - ``lm_duration_days = stop_date - landmark_date`` (days)
+          - ``lm_event = 1`` only if failure occurred strictly after landmark.
+
+    For backwards compatibility, also copies ``lm_duration_days``/``lm_event``
+    into ``time_col``/``event_col`` in the returned dataset.
+    """
     out = episodes.copy()
-    out = out[out[time_col] > landmark_days].copy()
-    out[time_col] = out[time_col] - landmark_days
+
+    if cohort_value is not None and cohort_col in out.columns:
+        out = out[out[cohort_col].astype(str).str.strip() == str(cohort_value)].copy()
+
+    out[start_col] = pd.to_datetime(out.get(start_col), errors="coerce")
+    out[stop_col] = pd.to_datetime(out.get(stop_col), errors="coerce")
+    out[failure_col] = pd.to_datetime(out.get(failure_col), errors="coerce")
+    out[event_col] = pd.to_numeric(out.get(event_col), errors="coerce").fillna(0).astype(int)
+
+    out[time_col] = pd.to_numeric(out.get(time_col), errors="coerce")
+    out["landmark_date"] = out[start_col] + pd.Timedelta(days=landmark_days)
+
+    failure_on_or_before_landmark = (
+        (out[event_col] == 1)
+        & out[failure_col].notna()
+        & out["landmark_date"].notna()
+        & (out[failure_col] <= out["landmark_date"])
+    )
+    censored_on_or_before_landmark = (
+        (out[event_col] == 0)
+        & out[stop_col].notna()
+        & out["landmark_date"].notna()
+        & (out[stop_col] <= out["landmark_date"])
+    )
+
+    out["eligible_at_landmark"] = (
+        out[start_col].notna()
+        & out[stop_col].notna()
+        & out["landmark_date"].notna()
+        & out[time_col].notna()
+        & (out[time_col] > landmark_days)
+        & (out[stop_col] > out["landmark_date"])
+        & (~failure_on_or_before_landmark)
+        & (~censored_on_or_before_landmark)
+    )
+
+    lm = out[out["eligible_at_landmark"]].copy()
+    lm["lm_duration_days"] = (lm[stop_col] - lm["landmark_date"]).dt.days
+    lm["lm_event"] = (
+        (lm[event_col] == 1)
+        & lm[failure_col].notna()
+        & (lm[failure_col] > lm["landmark_date"])
+    ).astype(int)
+
+    lm = lm.dropna(subset=["lm_duration_days"]).copy()
+    lm = lm[lm["lm_duration_days"] >= 0].copy()
+    lm_nonpositive = int((lm["lm_duration_days"] <= 0).sum())
+
+    # Backward-compatible aliases for downstream code paths that still read
+    # TIME_COL / EVENT_COL only.
+    lm[time_col] = lm["lm_duration_days"]
+    lm[event_col] = lm["lm_event"]
+
+    if not return_qa:
+        return lm
+
+    n_before = int(len(out))
+    n_excluded = int((~out["eligible_at_landmark"]).sum())
+    n_included = int(len(lm))
+    n_failures_pre_excluded = int(failure_on_or_before_landmark.sum())
+    n_failures_post_included = int(lm["lm_event"].sum())
+
+    qa_counts = pd.DataFrame(
+        [
+            {"Metric": "number of primary RCT episodes before landmark", "Count": n_before},
+            {"Metric": "number excluded before landmark", "Count": n_excluded},
+            {"Metric": "number included in landmark cohort", "Count": n_included},
+            {"Metric": "number of failures before landmark excluded", "Count": n_failures_pre_excluded},
+            {"Metric": "number of failures after landmark included", "Count": n_failures_post_included},
+        ]
+    )
+
+    qa_flow = pd.DataFrame(
+        [
+            {
+                "Step": "Input episodes",
+                "Episodes": n_before,
+                "Failures": int(out[event_col].sum()),
+            },
+            {
+                "Step": "Eligible at landmark (stop_date > landmark_date)",
+                "Episodes": n_included,
+                "Failures": n_failures_post_included,
+            },
+            {
+                "Step": "Excluded before landmark",
+                "Episodes": n_excluded,
+                "Failures": int(((~out["eligible_at_landmark"]) & (out[event_col] == 1)).sum()),
+            },
+            {
+                "Step": "Excluded failures on/before landmark_date",
+                "Episodes": n_failures_pre_excluded,
+                "Failures": n_failures_pre_excluded,
+            },
+            {
+                "Step": "Excluded censored on/before landmark_date",
+                "Episodes": int(censored_on_or_before_landmark.sum()),
+                "Failures": 0,
+            },
+        ]
+    )
+
+    qa_events = pd.DataFrame(
+        [
+            {
+                "Metric": "Original events in eligible set",
+                "Count": int(out.loc[out["eligible_at_landmark"], event_col].sum()),
+            },
+            {
+                "Metric": "Post-landmark events (lm_event=1)",
+                "Count": int(lm["lm_event"].sum()),
+            },
+            {
+                "Metric": "Original events reclassified to 0 at landmark",
+                "Count": int(
+                    (
+                        (out["eligible_at_landmark"])
+                        & (out[event_col] == 1)
+                        & (~(
+                            out[failure_col].notna()
+                            & (out[failure_col] > out["landmark_date"])
+                        ))
+                    ).sum()
+                ),
+            },
+        ]
+    )
+
+    qa_duration = pd.DataFrame(
+        [
+            {
+                "Metric": "Min lm_duration_days",
+                "Value": float(lm["lm_duration_days"].min()) if len(lm) else np.nan,
+            },
+            {
+                "Metric": "Median lm_duration_days",
+                "Value": float(lm["lm_duration_days"].median()) if len(lm) else np.nan,
+            },
+            {
+                "Metric": "Max lm_duration_days",
+                "Value": float(lm["lm_duration_days"].max()) if len(lm) else np.nan,
+            },
+            {
+                "Metric": "Count lm_duration_days <= 0",
+                "Value": lm_nonpositive,
+            },
+        ]
+    )
+
+    qa_resto = pd.DataFrame()
+    if "Coronal_Restoration_Group" in lm.columns:
+        qa_resto = (
+            lm["Coronal_Restoration_Group"]
+            .value_counts(dropna=False)
+            .rename_axis("Coronal_Restoration_Group")
+            .reset_index(name="Episodes")
+        )
+        qa_resto["Percent"] = np.where(
+            len(lm) > 0,
+            (qa_resto["Episodes"] / len(lm) * 100.0).round(2),
+            np.nan,
+        )
+
+    qa_resto_by_event = pd.DataFrame()
+    if "Coronal_Restoration_Group" in lm.columns and "lm_event" in lm.columns:
+        qa_resto_by_event = pd.crosstab(
+            lm["Coronal_Restoration_Group"],
+            lm["lm_event"],
+            dropna=False,
+        ).reset_index()
+
+    qa = {
+        "landmark_required_counts": qa_counts,
+        "landmark_flow": qa_flow,
+        "landmark_event_reclassification": qa_events,
+        "landmark_duration": qa_duration,
+        "landmark_restoration_groups": qa_resto,
+        "landmark_restoration_by_event": qa_resto_by_event,
+    }
+    return lm, qa
+
+
+def _pick_first_col(df: pd.DataFrame, candidates: Sequence[str]) -> Optional[str]:
+    """Return the first matching column from candidates, or None."""
+    for col in candidates:
+        if col in df.columns:
+            return col
+    return None
+
+
+def _r_name(name: str) -> str:
+    """Backtick-quote an R identifier while preserving literal text."""
+    return "`" + str(name).replace("`", "") + "`"
+
+
+def _build_r_hr_table(coef_df: pd.DataFrame, conf_df: pd.DataFrame) -> pd.DataFrame:
+    """Convert R coxph summary/cof.int tables into the notebook HR schema."""
+    coef_df = coef_df.copy()
+    conf_df = conf_df.copy()
+
+    if "term" not in coef_df.columns:
+        coef_df = coef_df.reset_index().rename(columns={"index": "term"})
+    if "term" not in conf_df.columns:
+        conf_df = conf_df.reset_index().rename(columns={"index": "term"})
+
+    merged = coef_df.merge(conf_df, on="term", how="inner", suffixes=("_coef", "_ci"))
+
+    hr_col = _pick_first_col(merged, ["exp(coef)_ci", "exp(coef)"])
+    lo_col = _pick_first_col(merged, ["lower .95", "lower 0.95", "lower 95%"])
+    hi_col = _pick_first_col(merged, ["upper .95", "upper 0.95", "upper 95%"])
+    p_col = _pick_first_col(merged, ["Pr(>|z|)", "p", "pvalue"])
+
+    if hr_col is None or lo_col is None or hi_col is None or p_col is None:
+        raise ValueError("R Cox summary missing expected columns for HR output.")
+
+    out = pd.DataFrame(
+        {
+            "Variable": (
+                merged["term"]
+                .astype(str)
+                .str.replace("`", "", regex=False)
+                .str.replace(r"True$", "", regex=True)
+                .str.replace(r"FALSE$", "", regex=True)
+            ),
+            "HR": pd.to_numeric(merged[hr_col], errors="coerce"),
+            "95% CI (lower)": pd.to_numeric(merged[lo_col], errors="coerce"),
+            "95% CI (upper)": pd.to_numeric(merged[hi_col], errors="coerce"),
+            "p_cox": pd.to_numeric(merged[p_col], errors="coerce"),
+        }
+    )
+    out = out.dropna(subset=["HR", "95% CI (lower)", "95% CI (upper)", "p_cox"])
+    out = out.sort_values("p_cox").reset_index(drop=True)
     return out
+
+
+def _build_r_ph_table(zph_df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize cox.zph output to a stable PH summary table."""
+    zph_df = zph_df.copy()
+    if "Variable" not in zph_df.columns:
+        zph_df = zph_df.reset_index().rename(columns={"index": "Variable"})
+
+    p_col = _pick_first_col(zph_df, ["p", "p_value", "Pr(>|z|)"])
+    chisq_col = _pick_first_col(zph_df, ["chisq", "chisq.", "chisq_stat"])
+
+    out = pd.DataFrame(
+        {
+            "Variable": (
+                zph_df["Variable"]
+                .astype(str)
+                .str.replace("`", "", regex=False)
+                .str.replace(r"True$", "", regex=True)
+                .str.replace(r"FALSE$", "", regex=True)
+            ),
+            "chisq": pd.to_numeric(zph_df[chisq_col], errors="coerce") if chisq_col else np.nan,
+            "p_ph": pd.to_numeric(zph_df[p_col], errors="coerce") if p_col else np.nan,
+        }
+    )
+    return out.sort_values("p_ph", na_position="last").reset_index(drop=True)
+
+
+def _fit_landmark_cox_rpy2(
+    x_fit: pd.DataFrame,
+    time_col: str,
+    event_col: str,
+    cluster_col: Optional[str],
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Run landmark Cox + PH test in R through rpy2."""
+    from rpy2 import robjects as ro
+    from rpy2.robjects import conversion, default_converter, pandas2ri
+
+    terms = [c for c in x_fit.columns if c not in [time_col, event_col, cluster_col]]
+    if not terms:
+        raise ValueError("No model terms remain after matrix construction.")
+
+    rhs_terms = [_r_name(c) for c in terms]
+    if cluster_col and cluster_col in x_fit.columns:
+        rhs_terms.append(f"cluster({_r_name(cluster_col)})")
+
+    formula = f"survival::Surv({_r_name(time_col)}, {_r_name(event_col)}) ~ " + " + ".join(rhs_terms)
+
+    with conversion.localconverter(default_converter + pandas2ri.converter):
+        ro.globalenv["df_py"] = conversion.py2rpy(x_fit)
+
+    ro.r("library(survival)")
+    ro.r(f"fit <- survival::coxph({formula}, data=df_py, ties='efron', robust=TRUE)")
+
+    with conversion.localconverter(default_converter + pandas2ri.converter):
+        coef_df = conversion.rpy2py(
+            ro.r("data.frame(term=rownames(summary(fit)$coefficients), summary(fit)$coefficients, check.names=FALSE)")
+        )
+        conf_df = conversion.rpy2py(
+            ro.r("data.frame(term=rownames(summary(fit)$conf.int), summary(fit)$conf.int, check.names=FALSE)")
+        )
+        zph_df = conversion.rpy2py(
+            ro.r("data.frame(Variable=rownames(survival::cox.zph(fit)$table), survival::cox.zph(fit)$table, check.names=FALSE)")
+        )
+
+    hr_tbl = _build_r_hr_table(coef_df, conf_df)
+    ph_tbl = _build_r_ph_table(zph_df)
+    return hr_tbl, ph_tbl
+
+
+def _fit_landmark_cox_rscript(
+    x_fit: pd.DataFrame,
+    time_col: str,
+    event_col: str,
+    cluster_col: Optional[str],
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Run landmark Cox + PH test by shelling out to Rscript."""
+    rscript = shutil.which("Rscript")
+    if not rscript:
+        raise RuntimeError("Neither rpy2 nor Rscript is available for R execution.")
+
+    with tempfile.TemporaryDirectory() as td:
+        in_csv = os.path.join(td, "cox_input.csv")
+        out_coef = os.path.join(td, "cox_coef.csv")
+        out_conf = os.path.join(td, "cox_conf.csv")
+        out_ph = os.path.join(td, "cox_ph.csv")
+        r_file = os.path.join(td, "run_cox.R")
+
+        x_fit.to_csv(in_csv, index=False, encoding="utf-8")
+
+        r_code = """
+args <- commandArgs(trailingOnly=TRUE)
+in_csv <- args[1]
+out_coef <- args[2]
+out_conf <- args[3]
+out_ph <- args[4]
+time_col <- args[5]
+event_col <- args[6]
+cluster_col <- args[7]
+
+library(survival)
+df <- read.csv(in_csv, check.names=FALSE)
+
+terms <- setdiff(colnames(df), c(time_col, event_col, cluster_col))
+if (length(terms) == 0) {
+  stop("No model terms remain after matrix construction.")
+}
+rhs_terms <- sprintf("`%s`", terms)
+if (nzchar(cluster_col) && cluster_col %in% colnames(df)) {
+  rhs_terms <- c(rhs_terms, sprintf("cluster(`%s`)", cluster_col))
+}
+rhs <- paste(rhs_terms, collapse=" + ")
+fml <- as.formula(paste0("survival::Surv(`", time_col, "`, `", event_col, "`) ~ ", rhs))
+
+fit <- survival::coxph(fml, data=df, ties="efron", robust=TRUE)
+
+s <- summary(fit)
+coef_df <- data.frame(term=rownames(s$coefficients), s$coefficients, check.names=FALSE)
+conf_df <- data.frame(term=rownames(s$conf.int), s$conf.int, check.names=FALSE)
+zph <- survival::cox.zph(fit)
+zph_df <- data.frame(Variable=rownames(zph$table), zph$table, check.names=FALSE)
+
+hr <- merge(coef_df, conf_df, by="term", all=FALSE)
+write.csv(coef_df, out_coef, row.names=FALSE, fileEncoding="UTF-8")
+write.csv(conf_df, out_conf, row.names=FALSE, fileEncoding="UTF-8")
+write.csv(zph_df, out_ph, row.names=FALSE, fileEncoding="UTF-8")
+""".strip()
+
+        with open(r_file, "w", encoding="utf-8") as f:
+            f.write(r_code)
+
+        cluster_arg = cluster_col if cluster_col and cluster_col in x_fit.columns else ""
+        proc = subprocess.run(
+            [
+                rscript,
+                r_file,
+                in_csv,
+                out_coef,
+                out_conf,
+                out_ph,
+                time_col,
+                event_col,
+                cluster_arg,
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if proc.returncode != 0:
+            stderr = (proc.stderr or "").strip()
+            stdout = (proc.stdout or "").strip()
+            raise RuntimeError(f"Rscript failed. stdout={stdout} stderr={stderr}")
+
+        coef_raw = pd.read_csv(out_coef)
+        conf_raw = pd.read_csv(out_conf)
+        ph_raw = pd.read_csv(out_ph)
+        hr_tbl = _build_r_hr_table(coef_raw, conf_raw)
+        ph_tbl = _build_r_ph_table(ph_raw)
+        return hr_tbl, ph_tbl
+
+
+def fit_landmark_cox_r(
+    df: pd.DataFrame,
+    include_cols: Sequence[str],
+    time_col: str = "lm_duration_days",
+    event_col: str = "lm_event",
+    cluster_col: str = ID_COL,
+    min_positive: int = 20,
+) -> Tuple[Optional[Any], Optional[pd.DataFrame], Optional[pd.DataFrame], Dict[str, Any], Optional[str]]:
+    """Fit a landmark Cox model in R (via Python) and run PH diagnostics.
+
+    Returns
+    -------
+    model : None
+        Placeholder for interface compatibility with lifelines-based callers.
+    hr_table : DataFrame or None
+        Hazard-ratio table with columns matching existing notebook consumers.
+    ph_table : DataFrame or None
+        Per-term PH diagnostics from ``cox.zph`` including ``GLOBAL`` row.
+    meta : dict
+        Execution metadata including selected R backend.
+    error : str or None
+        Error message on failure.
+    """
+    x_fit, err = build_cox_matrix(
+        df,
+        include_cols,
+        time_col=time_col,
+        event_col=event_col,
+        min_positive=min_positive,
+    )
+    if err:
+        return None, None, None, {"backend": None}, err
+    if x_fit is None or x_fit.empty:
+        return None, None, None, {"backend": None}, "Empty design matrix."
+
+    x_fit[time_col] = pd.to_numeric(x_fit[time_col], errors="coerce")
+    x_fit[event_col] = pd.to_numeric(x_fit[event_col], errors="coerce").fillna(0).astype(int)
+
+    covariate_cols = [c for c in x_fit.columns if c not in [time_col, event_col, cluster_col]]
+    for c in covariate_cols:
+        x_fit[c] = pd.to_numeric(x_fit[c], errors="coerce").fillna(0).astype(float)
+
+    if cluster_col in df.columns:
+        cluster_series = df.loc[x_fit.index, cluster_col]
+        x_fit[cluster_col] = cluster_series.astype("string").fillna("<missing>").astype(str).values
+
+    try:
+        hr_tbl, ph_tbl = _fit_landmark_cox_rscript(x_fit, time_col, event_col, cluster_col)
+        return None, hr_tbl, ph_tbl, {"backend": "Rscript", "rows": int(len(x_fit))}, None
+    except Exception as e_rscript:
+        try:
+            hr_tbl, ph_tbl = _fit_landmark_cox_rpy2(x_fit, time_col, event_col, cluster_col)
+            return None, hr_tbl, ph_tbl, {"backend": "rpy2", "rows": int(len(x_fit))}, None
+        except Exception as e_rpy2:
+            msg = (
+                "R landmark Cox failed via both backends. "
+                f"Rscript error: {e_rscript}; rpy2 error: {e_rpy2}"
+            )
+            return None, None, None, {"backend": None, "rows": int(len(x_fit))}, msg
 
 
 # =============================================================================
