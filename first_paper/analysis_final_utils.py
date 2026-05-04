@@ -33,6 +33,7 @@ from __future__ import annotations
 # Imports
 # =============================================================================
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -937,7 +938,11 @@ def _fit_landmark_cox_rscript(
     """Run landmark Cox + PH test by shelling out to Rscript."""
     rscript = shutil.which("Rscript")
     if not rscript:
-        raise RuntimeError("Neither rpy2 nor Rscript is available for R execution.")
+        raise RuntimeError(
+            "Rscript was not found. Install R and ensure Rscript is on PATH. "
+            "Windows example: install R from CRAN, then verify by running 'Rscript --version' "
+            "in a new terminal."
+        )
 
     with tempfile.TemporaryDirectory() as td:
         in_csv = os.path.join(td, "cox_input.csv")
@@ -1009,7 +1014,10 @@ write.csv(zph_df, out_ph, row.names=FALSE, fileEncoding="UTF-8")
         if proc.returncode != 0:
             stderr = (proc.stderr or "").strip()
             stdout = (proc.stdout or "").strip()
-            raise RuntimeError(f"Rscript failed. stdout={stdout} stderr={stderr}")
+            raise RuntimeError(
+                "Rscript failed while fitting landmark Cox. "
+                f"stdout={stdout} stderr={stderr}"
+            )
 
         coef_raw = pd.read_csv(out_coef)
         conf_raw = pd.read_csv(out_conf)
@@ -1065,19 +1073,60 @@ def fit_landmark_cox_r(
         cluster_series = df.loc[x_fit.index, cluster_col]
         x_fit[cluster_col] = cluster_series.astype("string").fillna("<missing>").astype(str).values
 
+    # R backends can break on non-ASCII/symbol-heavy column names (for example,
+    # AgeGroup_≥60). Use safe ASCII names for fitting, then map back in outputs.
+    def _sanitize_for_r(name: str) -> str:
+        safe = re.sub(r"[^0-9A-Za-z_]+", "_", str(name))
+        safe = re.sub(r"_+", "_", safe).strip("_")
+        if not safe:
+            safe = "x"
+        if safe[0].isdigit():
+            safe = f"x_{safe}"
+        return safe
+
+    protected = {time_col, event_col, cluster_col}
+    rename_map: Dict[str, str] = {}
+    used = set(x_fit.columns)
+    for col in covariate_cols:
+        target = _sanitize_for_r(col)
+        if target in protected:
+            target = f"cov_{target}"
+        i = 1
+        base = target
+        while target in used and target != col:
+            target = f"{base}_{i}"
+            i += 1
+        rename_map[col] = target
+        used.add(target)
+
+    x_fit_r = x_fit.rename(columns=rename_map)
+    inverse_name_map = {v: k for k, v in rename_map.items()}
+
+    def _restore_variable_names(tbl: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
+        if tbl is None or not isinstance(tbl, pd.DataFrame) or "Variable" not in tbl.columns:
+            return tbl
+        out = tbl.copy()
+        out["Variable"] = out["Variable"].map(lambda v: inverse_name_map.get(str(v), v))
+        return out
+
     try:
-        hr_tbl, ph_tbl = _fit_landmark_cox_rscript(x_fit, time_col, event_col, cluster_col)
-        return None, hr_tbl, ph_tbl, {"backend": "Rscript", "rows": int(len(x_fit))}, None
+        hr_tbl, ph_tbl = _fit_landmark_cox_rscript(x_fit_r, time_col, event_col, cluster_col)
+        hr_tbl = _restore_variable_names(hr_tbl)
+        ph_tbl = _restore_variable_names(ph_tbl)
+        return None, hr_tbl, ph_tbl, {"backend": "Rscript", "rows": int(len(x_fit_r))}, None
     except Exception as e_rscript:
         try:
-            hr_tbl, ph_tbl = _fit_landmark_cox_rpy2(x_fit, time_col, event_col, cluster_col)
-            return None, hr_tbl, ph_tbl, {"backend": "rpy2", "rows": int(len(x_fit))}, None
+            hr_tbl, ph_tbl = _fit_landmark_cox_rpy2(x_fit_r, time_col, event_col, cluster_col)
+            hr_tbl = _restore_variable_names(hr_tbl)
+            ph_tbl = _restore_variable_names(ph_tbl)
+            return None, hr_tbl, ph_tbl, {"backend": "rpy2", "rows": int(len(x_fit_r))}, None
         except Exception as e_rpy2:
             msg = (
                 "R landmark Cox failed via both backends. "
+                "Install R and confirm Rscript is available on PATH, or install rpy2 in the active environment. "
                 f"Rscript error: {e_rscript}; rpy2 error: {e_rpy2}"
             )
-            return None, None, None, {"backend": None, "rows": int(len(x_fit))}, msg
+            return None, None, None, {"backend": None, "rows": int(len(x_fit_r))}, msg
 
 
 # =============================================================================
